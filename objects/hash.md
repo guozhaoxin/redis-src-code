@@ -323,9 +323,9 @@ do {
             }
 
             /* Increment the reverse cursor not covered by the smaller mask.*/
-            v |= ~m1;
+            v |= ~m1; // v 的高位全部为1，低位保留
             v = rev(v);
-            v++;
+            v++; // 高位加1
             v = rev(v);
 
             /* Continue while bits covered by mask difference is non-zero */
