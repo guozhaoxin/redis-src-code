@@ -60,3 +60,58 @@ typedef struct zlentry {
 
 
 
+### 压缩表操作
+
+#### 索引元素
+
+由于压缩表是中元素紧凑、每个元素长度不定，导致按照索引获取元素时，就需要全结构遍历。压缩表中索引元素时，支持负索引，此时是按照从压缩表尾往头数的，源码如下：
+
+```c
+unsigned char *ziplistIndex(unsigned char *zl, int index) {
+    unsigned char *p;
+    unsigned int prevlensize, prevlen = 0;
+    if (index < 0) {
+        index = (-index)-1;
+        p = ZIPLIST_ENTRY_TAIL(zl);
+        if (p[0] != ZIP_END) {
+            ZIP_DECODE_PREVLEN(p, prevlensize, prevlen);
+            while (prevlen > 0 && index--) {
+                p -= prevlen;
+                ZIP_DECODE_PREVLEN(p, prevlensize, prevlen); // 宏定义会解析当前 entry 的字段，求出前一项的字节数。
+            }
+        }
+    } else {
+        p = ZIPLIST_ENTRY_HEAD(zl); // 获取到头 entry 的位置
+        while (p[0] != ZIP_END && index--) {
+            p += zipRawEntryLength(p);  // 函数返回当前 entry 占用的字节总数，包括 prev、encoding、content 三部分各自长度
+        }
+    }
+    return (p[0] == ZIP_END || index > 0) ? NULL : p;
+}
+```
+
+
+
+#### 获取元素数量
+
+压缩表中的 zllength 字段，是用来记录 entry 数量的，但是它只占用 2 字节，所以如果 entry 数量超过一定值，就需要完整遍历压缩表才能知道了：
+
+```c
+unsigned int ziplistLen(unsigned char *zl) {
+    unsigned int len = 0;
+    if (intrev16ifbe(ZIPLIST_LENGTH(zl)) < UINT16_MAX) { // zllength 没溢出，可以直接读取并返回；
+        len = intrev16ifbe(ZIPLIST_LENGTH(zl));
+    } else {
+        unsigned char *p = zl+ZIPLIST_HEADER_SIZE; // 开始遍历压缩表
+        while (*p != ZIP_END) {
+            p += zipRawEntryLength(p);
+            len++;
+        }
+
+        /* Re-store length if small enough */
+        if (len < UINT16_MAX) ZIPLIST_LENGTH(zl) = intrev16ifbe(len); // 如果遍历结果显示数量不大，需要更新回去。
+    }
+    return len;
+}
+```
+
