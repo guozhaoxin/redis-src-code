@@ -115,3 +115,103 @@ unsigned int ziplistLen(unsigned char *zl) {
 }
 ```
 
+
+
+#### 插入元素
+
+```c
+// ziplist.c
+static unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, unsigned char *s, unsigned int slen) {
+    size_t curlen = intrev32ifbe(ZIPLIST_BYTES(zl)), reqlen;
+    unsigned int prevlensize, prevlen = 0;
+    size_t offset;
+    int nextdiff = 0;
+    unsigned char encoding = 0;
+    long long value = 123456789; /* initialized to avoid warning. Using a value
+                                    that is easy to see if for some reason
+                                    we use it uninitialized. */
+    zlentry tail;
+
+    /* Find out prevlen for the entry that is inserted. */
+    if (p[0] != ZIP_END) {
+        ZIP_DECODE_PREVLEN(p, prevlensize, prevlen); // 求出 p 指向的 entry 的前一项的长度等信息
+    } else { // p 指向压缩表的 最后一个字节
+        unsigned char *ptail = ZIPLIST_ENTRY_TAIL(zl);
+        if (ptail[0] != ZIP_END) { // 说明此时压缩表是非空的，至少有一个 entry
+            prevlen = zipRawEntryLength(ptail);
+        }
+    }
+
+    /* See if the entry can be encoded */
+    if (zipTryEncoding(s,slen,&value,&encoding)) {
+        /* 'encoding' is set to the appropriate integer encoding */
+        reqlen = zipIntSize(encoding);
+    } else {
+        /* 'encoding' is untouched, however zipEncodeLength will use the
+         * string length to figure out how to encode it. */
+        reqlen = slen;
+    }
+    /* We need space for both the length of the previous entry and
+     * the length of the payload. */
+    reqlen += zipPrevEncodeLength(NULL,prevlen); // 表示前一项长度需要的字节数
+    reqlen += zipEncodeLength(NULL,encoding,slen); // 表示当前项 encoding 等需要占用的字节数
+
+    /* When the insert position is not equal to the tail, we need to
+     * make sure that the next entry can hold this entry's length in
+     * its prevlen field. */
+    nextdiff = (p[0] != ZIP_END) ? zipPrevLenByteDiff(p,reqlen) : 0;
+
+    /* Store offset because a realloc may change the address of zl. */
+    offset = p-zl;
+    zl = ziplistResize(zl,curlen+reqlen+nextdiff);
+    p = zl+offset;
+
+    /* Apply memory move when necessary and update tail offset. */
+    if (p[0] != ZIP_END) {
+        /* Subtract one because of the ZIP_END bytes */
+        memmove(p+reqlen,p-nextdiff,curlen-offset-1+nextdiff);
+
+        /* Encode this entry's raw length in the next entry. */
+        zipPrevEncodeLength(p+reqlen,reqlen);
+
+        /* Update offset for tail */
+        ZIPLIST_TAIL_OFFSET(zl) =
+            intrev32ifbe(intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl))+reqlen);
+
+        /* When the tail contains more than one entry, we need to take
+         * "nextdiff" in account as well. Otherwise, a change in the
+         * size of prevlen doesn't have an effect on the *tail* offset. */
+        tail = zipEntry(p+reqlen);
+        if (p[reqlen+tail.headersize+tail.len] != ZIP_END) {
+            ZIPLIST_TAIL_OFFSET(zl) =
+                intrev32ifbe(intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl))+nextdiff);
+        }
+    } else {
+        /* This element will be the new tail. */
+        ZIPLIST_TAIL_OFFSET(zl) = intrev32ifbe(p-zl);
+    }
+
+    /* When nextdiff != 0, the raw length of the next entry has changed, so
+     * we need to cascade the update throughout the ziplist */
+    if (nextdiff != 0) {
+        offset = p-zl;
+        zl = __ziplistCascadeUpdate(zl,p+reqlen);
+        p = zl+offset;
+    }
+
+    /* Write the entry */
+    p += zipPrevEncodeLength(p,prevlen);
+    p += zipEncodeLength(p,encoding,slen);
+    if (ZIP_IS_STR(encoding)) {
+        memcpy(p,s,slen);
+    } else {
+        zipSaveInteger(p,value,encoding);
+    }
+    ZIPLIST_INCR_LENGTH(zl,1);
+    return zl;
+}
+```
+
+压缩表添加元素时，支持表头、表尾插入，这个函数中的 p 参数可以是表头，也可以是表尾，上层调用函数指定；s 为要插入的元素，而 slen 表示 s 的长度。
+
+此外需要注意的是，s 作为要插入的内容，我们并不知道它表示的到底是一个字节数组，还是一个整数值，函数内部会调用 zipTryEncoding 尝试将其转为整数，如果可以转换成功，就认为 s 是个整数，否则认为是个字节数组；
