@@ -131,7 +131,7 @@ static unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, unsig
                                     that is easy to see if for some reason
                                     we use it uninitialized. */
     zlentry tail;
-
+	// 第一步，计算出插入位置前面一项的长度
     /* Find out prevlen for the entry that is inserted. */
     if (p[0] != ZIP_END) {
         ZIP_DECODE_PREVLEN(p, prevlensize, prevlen); // 求出 p 指向的 entry 的前一项的长度等信息
@@ -141,7 +141,8 @@ static unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, unsig
             prevlen = zipRawEntryLength(ptail);
         }
     }
-
+	
+    // 设置 encoding 类型
     /* See if the entry can be encoded */
     if (zipTryEncoding(s,slen,&value,&encoding)) {
         /* 'encoding' is set to the appropriate integer encoding */
@@ -151,6 +152,8 @@ static unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, unsig
          * string length to figure out how to encode it. */
         reqlen = slen;
     }
+    
+    // 计算新的 entry 的总字节数
     /* We need space for both the length of the previous entry and
      * the length of the payload. */
     reqlen += zipPrevEncodeLength(NULL,prevlen); // 表示前一项长度需要的字节数
@@ -215,3 +218,91 @@ static unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, unsig
 压缩表添加元素时，支持表头、表尾插入，这个函数中的 p 参数可以是表头，也可以是表尾，上层调用函数指定；s 为要插入的元素，而 slen 表示 s 的长度。
 
 此外需要注意的是，s 作为要插入的内容，我们并不知道它表示的到底是一个字节数组，还是一个整数值，函数内部会调用 zipTryEncoding 尝试将其转为整数，如果可以转换成功，就认为 s 是个整数，否则认为是个字节数组；
+
+整个函数的逻辑如下：![ziplist-insert](./picture/ziplist-insert.png)
+
+这个函数需要注意的地方是，因为插入新的数据，可能导致调整新项后面的 entry 的 prevlensize 变化；代码通过一个 nextdiff 变量来记录是否需要调整。
+
+
+
+#### 删除元素
+
+```c
+// ziplist.c
+static unsigned char *__ziplistDelete(unsigned char *zl, unsigned char *p, unsigned int num) {
+    unsigned int i, totlen, deleted = 0;
+    size_t offset;
+    int nextdiff = 0;
+    zlentry first, tail;
+
+    first = zipEntry(p);
+    for (i = 0; p[0] != ZIP_END && i < num; i++) {
+        p += zipRawEntryLength(p);
+        deleted++;
+    }
+
+    totlen = p-first.p;
+    if (totlen > 0) {
+        if (p[0] != ZIP_END) {
+            /* Storing `prevrawlen` in this entry may increase or decrease the
+             * number of bytes required compare to the current `prevrawlen`.
+             * There always is room to store this, because it was previously
+             * stored by an entry that is now being deleted. */
+            nextdiff = zipPrevLenByteDiff(p,first.prevrawlen);
+            p -= nextdiff; // 假设需要扩容，则返回 4，p 要左移，占用部分前一项的空间；假设需要缩容，则返回 -4，p 要右移，释放部分自己的空间；
+            zipPrevEncodeLength(p,first.prevrawlen);
+
+            /* Update offset for tail */
+            ZIPLIST_TAIL_OFFSET(zl) =
+                intrev32ifbe(intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl))-totlen); // 为什么只减去 totlen？nextdiff 不处理吗？
+
+            /* When the tail contains more than one entry, we need to take
+             * "nextdiff" in account as well. Otherwise, a change in the
+             * size of prevlen doesn't have an effect on the *tail* offset. */
+            tail = zipEntry(p);
+            if (p[tail.headersize+tail.len] != ZIP_END) {
+                ZIPLIST_TAIL_OFFSET(zl) =
+                   intrev32ifbe(intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl))+nextdiff); // 扩容时，需要增加字节；缩容时，需要减小字节；
+            }
+
+            /* Move tail to the front of the ziplist */
+            memmove(first.p,p,
+                intrev32ifbe(ZIPLIST_BYTES(zl))-(p-zl)-1);
+        } else {
+            /* The entire tail was deleted. No need to move memory. */
+            ZIPLIST_TAIL_OFFSET(zl) =
+                intrev32ifbe((first.p-zl)-first.prevrawlen); // 新的 tail 节点是 first 前面的节点。
+        }
+
+        /* Resize and update length */
+        offset = first.p-zl; // 因为下面会重新分配内存，导致 first.p 指向的内存不可用，所以必须先计算出偏移量并保存，方便后续操作。
+        zl = ziplistResize(zl, intrev32ifbe(ZIPLIST_BYTES(zl))-totlen+nextdiff);
+        ZIPLIST_INCR_LENGTH(zl,-deleted);
+        p = zl+offset;
+
+        /* When nextdiff != 0, the raw length of the next entry has changed, so
+         * we need to cascade the update throughout the ziplist */
+        if (nextdiff != 0)
+            zl = __ziplistCascadeUpdate(zl,p);
+    }
+    return zl;
+}
+```
+
+这个函数指定要删除的元素的起始位置，以及连续删除的数量。
+
+整个函数的逻辑与插入比较像，同样需要考虑是否要连续调整多个节点的 prev。
+
+有一点要注意的是，被删除的最后一个节点之后的那个节点(上面代码中的 p)，它现在的 prev 表示被删除的第一个节点前面的那一项，即上面代码中 first 的前一项；代码中通过调整 p 的左移或者右移，来调整此时 p 的prev，最后把 p 开始到 ZLEND 的整个空间都左移到 p 起始的位置即可。关键是 p 的左右移动会不会发生溢出？只要分三种情况考虑即可，假设 first 的前面一项是 x，然后被删除的节点只有 first 一项：
+
+##### case 1
+
+假设 x 比较短，其大小只要 1 个字节表示，则 first 的 prev 只要 1 个字节；如果 first 本身也比较短，其长度用 1 个字节表示即可，则 p 的 prev 只要 1 个字节；当 first 被删除后，nextdiff 为 0， p 不需要移动；
+
+#####  case 2
+
+基本同上，但 first 比较长，假设其长度大小 1 字节表示不了，此时 p 的 prev 必然用 5 字节表示；删除 first 后，p 的前一项变成了 x，prev 只要 1 字节表示，p 会向右移动 4 个字节，因为原来 p 的 prev 字段占用 5 字节，不会溢出；
+
+##### case 3
+
+假设 x 比较长，大小需要用 5 字节表示，则对 first 来说，它至少占用 5 + 1 + 1 = 7 个字节，即这段被删除的空间至少有 7 字节长，而 p 如果要左移，最多也就 4 个字节，也不会发生溢出；
