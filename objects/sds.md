@@ -589,3 +589,21 @@ cleanup:
 类似于字符串分割，将一个给定的字符串按照给定的分隔符进行切分，每个分割出来的都作为一个新的 sds，加入到一个 sds 数组中。
 
 其中，count 指针存储返回的 sds 数组长度，用 tokens 表示返回的 sds *数组；为了避免频繁申请内存，代码中 tokens 的长度要比返回的 tokens 长一些，而且返回之前没有做消除处理。
+
+
+
+# 3.0 中的 sds
+
+早期的 sds 与上面的 sds 结构有一些不同，结构更简单，如下：
+
+```c
+typedef char *sds;
+
+struct sdshdr {
+    unsigned int len;
+    unsigned int free;
+    char buf[];
+};
+```
+
+可以看到，3.0 中的 sds 只有一种固定的结构体，不会区分类型。
