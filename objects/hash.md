@@ -1,14 +1,15 @@
 ## 哈希
 
-哈希恐怕是 redis 中最复杂的。
+哈希是 redis 中最复杂的数据结构之一，要比 sds、intset、list 这些复杂很多。
 
 ### 哈希结构
 
-![hash-hash](./picture/hash-hash.png)
+![dict-struct](./picture/dict-struct.jpg)
 
 #### 哈希条目
 
 ```c
+// dict.h
 typedef struct dictEntry {
     void *key;
     union {
@@ -32,6 +33,7 @@ redis 中的哈希表使用桶 + 单向链表的方式实现，哈希值相同�
 #### 哈希函数
 
 ```c
+// dict.h
 typedef struct dictType {
     unsigned int (*hashFunction)(const void *key);
     void *(*keyDup)(void *privdata, const void *key);
@@ -49,6 +51,7 @@ typedef struct dictType {
 #### 哈希表
 
 ```c
+// dict.h
 typedef struct dictht {
     dictEntry **table;
     unsigned long size;
@@ -60,7 +63,7 @@ typedef struct dictht {
 哈希表存储所有的键值对，各参数意义如下：
 
 - table, 这是一个数组，数组中每个元素指向一个 dictEntry 对象，进而存储在当前表大小下所有哈希值相同的键值对；
-- size, 数组的大小，2 的幂次；
+- size, 数组的大小，一定是 2  的幂次数；
 - sizemask, 用来计算一个键的掩码，大小为 size - 1，与 size 一起决定一个键值对应该存在 table 的哪个链表上；
 - used, 表示已有的键值对数量，与 size 一起，决定字典的 rehash；
 
@@ -69,6 +72,7 @@ typedef struct dictht {
 #### 字典
 
 ```c
+// dict.h
 typedef struct dict {
     dictType *type;
     void *privdata;
@@ -95,6 +99,7 @@ redis 的字典，当键值对过多或过少时，会发生扩缩容；为了�
 #### 扩容条件
 
 ```c
+// dict.c
 static int dict_can_resize = 1;
 static unsigned int dict_force_resize_ratio = 5;
 ```
@@ -106,10 +111,30 @@ redis 可以根据整体情况禁止扩容，但是如果键值对/表大小的�
 redis 的扩容触发源码可以参考 _dictExpandIfNeeded 函数：
 
 ```c
+// dict.c
 static int _dictExpandIfNeeded(dict *d)
+{
+    /* Incremental rehashing already in progress. Return. */
+    if (dictIsRehashing(d)) return DICT_OK;
+
+    /* If the hash table is empty expand it to the initial size. */
+    if (d->ht[0].size == 0) return dictExpand(d, DICT_HT_INITIAL_SIZE);
+
+    /* If we reached the 1:1 ratio, and we are allowed to resize the hash
+     * table (global setting) or we should avoid it but the ratio between
+     * elements/buckets is over the "safe" threshold, we resize doubling
+     * the number of buckets. */
+    if (d->ht[0].used >= d->ht[0].size &&
+        (dict_can_resize ||
+         d->ht[0].used/d->ht[0].size > dict_force_resize_ratio))
+    {
+        return dictExpand(d, d->ht[0].used*2);
+    }
+    return DICT_OK;
+}
 ```
 
-
+可以看到，redis 可以在一定情况下通过设置 dict_can_resize 全局变量禁止扩容，因为扩容涉及到大量健值对调整、重新申请内存等，比较费时；不过 redis 也强制当健值对太多的话，一定会进行 rehash，防止 dict 退化成链表。
 
 #### 扩缩容过程
 
@@ -119,9 +144,44 @@ static int _dictExpandIfNeeded(dict *d)
 - 给表 1 开辟空间；
 - 设置字典的 rehashidx 为 0，表示当前准备遍历的表 0 的桶索引；
 
-之后，当对一个字典进行添加(dictAdd)、查找(dictFind)、删除(dictGenericDelete) 等操作时，redis 都会先判断字典是否正处在 rehash 中，如果是的话，会
+dictExpand 函数如下：
 
-调用 _dictRehashStep 函数，这个函数会迁移 h[0] 表中最多一个桶的所有键值对到 h[1] 中。这个过程会一直持续到桶中数据都迁移到表 1 中，然后执行如下四步重置：
+```c
+// dict.c
+int dictExpand(dict *d, unsigned long size)
+{
+    dictht n; /* the new hash table */
+    unsigned long realsize = _dictNextPower(size); // 求出不小于 size 的下一个 2 次方幂整数；
+
+    /* the size is invalid if it is smaller than the number of
+     * elements already inside the hash table */
+    if (dictIsRehashing(d) || d->ht[0].used > size) // 如果字典正在 rehash 或者传入的 size 太小，就不执行 rehash；
+        return DICT_ERR;
+
+    /* Rehashing to the same table size is not useful. */
+    if (realsize == d->ht[0].size) return DICT_ERR;
+
+    /* Allocate the new hash table and initialize all pointers to NULL */
+    n.size = realsize;
+    n.sizemask = realsize-1;
+    n.table = zcalloc(realsize*sizeof(dictEntry*));
+    n.used = 0;
+
+    /* Is this the first initialization? If so it's not really a rehashing
+     * we just set the first hash table so that it can accept keys. */
+    if (d->ht[0].table == NULL) {
+        d->ht[0] = n;
+        return DICT_OK;
+    }
+
+    /* Prepare a second hash table for incremental rehashing */
+    d->ht[1] = n; // 设置 h[1] 表.
+    d->rehashidx = 0;
+    return DICT_OK;
+}
+```
+
+之后，当对一个字典进行添加(dictAdd)、查找(dictFind)、删除(dictGenericDelete) 等操作时，redis 都会先判断字典是否正处在 rehash 中，如果是的话，会调用 _dictRehashStep 函数，这个函数会迁移 h[0] 表中最多一个桶的所有键值对到 h[1] 中。这个过程会一直持续到桶中数据都迁移到表 1 中，然后执行如下四步重置：
 
 - 释放表 0 ；
 - 将表 0 指向新表；
@@ -137,7 +197,50 @@ static int _dictExpandIfNeeded(dict *d)
 #### dictGetRandomKey
 
 ```c
+// dict.c
 dictEntry *dictGetRandomKey(dict *d)
+{
+    dictEntry *he, *orighe;
+    unsigned int h;
+    int listlen, listele;
+
+    if (dictSize(d) == 0) return NULL;
+    if (dictIsRehashing(d)) _dictRehashStep(d);
+    if (dictIsRehashing(d)) {
+        do {
+            /* We are sure there are no elements in indexes from 0
+             * to rehashidx-1 */
+          	// 这个位置比较有意思，处于 rehash 状态的 dict，在 h[0] 中, 0-rehashidx 索引处是没有健值对的，
+            // 同时又要保证随机健是从 h[0] 和 h[1] 中随机出现的，所以下面这段比较复杂。
+            // 而且还要保证能找到一个有健值对的 entry。
+            h = d->rehashidx + (random() % (d->ht[0].size +
+                                            d->ht[1].size -
+                                            d->rehashidx));
+            he = (h >= d->ht[0].size) ? d->ht[1].table[h - d->ht[0].size] :
+                                      d->ht[0].table[h];
+        } while(he == NULL);
+    } else {
+        do {
+            h = random() & d->ht[0].sizemask;
+            he = d->ht[0].table[h];
+        } while(he == NULL);
+    }
+
+    /* Now we found a non empty bucket, but it is a linked
+     * list and we need to get a random element from the list.
+     * The only sane way to do so is counting the elements and
+     * select a random index. */
+    listlen = 0;
+    orighe = he;
+    while(he) {
+        he = he->next;
+        listlen++;
+    }
+    listele = random() % listlen;
+    he = orighe;
+    while(listele--) he = he->next;
+    return he;
+}
 ```
 
 该函数用来从字典中返回一个键值对，用在只需要返回一个键值对的场景下。
@@ -155,12 +258,78 @@ dictEntry *dictGetRandomKey(dict *d)
 #### dictGetSomeKeys
 
 ```c
-unsigned int dictGetSomeKeys(dict *d, dictEntry **des, unsigned int count)
+// dict.c
+unsigned int dictGetSomeKeys(dict *d, dictEntry **des, unsigned int count) {
+    unsigned int j; /* internal hash table id, 0 or 1. */
+    unsigned int tables; /* 1 or 2 tables? */
+    unsigned int stored = 0, maxsizemask;
+    unsigned int maxsteps;
+
+    if (dictSize(d) < count) count = dictSize(d);
+    maxsteps = count*10;
+
+    /* Try to do a rehashing work proportional to 'count'. */
+    for (j = 0; j < count; j++) {
+        if (dictIsRehashing(d))
+            _dictRehashStep(d);
+        else
+            break;
+    }
+
+    tables = dictIsRehashing(d) ? 2 : 1;
+    maxsizemask = d->ht[0].sizemask;
+    if (tables > 1 && maxsizemask < d->ht[1].sizemask)
+        maxsizemask = d->ht[1].sizemask;
+
+    /* Pick a random point inside the larger table. */
+    unsigned int i = random() & maxsizemask;
+    unsigned int emptylen = 0; /* Continuous empty entries so far. */
+    while(stored < count && maxsteps--) {
+        for (j = 0; j < tables; j++) {
+            /* Invariant of the dict.c rehashing: up to the indexes already
+             * visited in ht[0] during the rehashing, there are no populated
+             * buckets, so we can skip ht[0] for indexes between 0 and idx-1. */
+            if (tables == 2 && j == 0 && i < (unsigned int) d->rehashidx) {
+                /* Moreover, if we are currently out of range in the second
+                 * table, there will be no elements in both tables up to
+                 * the current rehashing index, so we jump if possible.
+                 * (this happens when going from big to small table). */
+                if (i >= d->ht[1].size) i = d->rehashidx;
+                continue;
+            }
+            if (i >= d->ht[j].size) continue; /* Out of range for this table. */
+            dictEntry *he = d->ht[j].table[i];
+
+            /* Count contiguous empty buckets, and jump to other
+             * locations if they reach 'count' (with a minimum of 5). */
+            if (he == NULL) {
+                emptylen++;
+                if (emptylen >= 5 && emptylen > count) {
+                    i = random() & maxsizemask;
+                    emptylen = 0;
+                }
+            } else {
+                emptylen = 0;
+                while (he) {
+                    /* Collect all the elements of the buckets found non
+                     * empty while iterating. */
+                    *des = he;
+                    des++;
+                    he = he->next;
+                    stored++;
+                    if (stored == count) return stored;
+                }
+            }
+        }
+        i = (i+1) & maxsizemask;
+    }
+    return stored;
+}
 ```
 
 这个函数从字典中获取指定数量的键值对，并存储到指定的位置。
 
-相对 dictGetRandomKey ，这个更快一些，因为它不需要遍历两次选中的链表；但它的随机分布并不好，因为在一个被选定的链表上，它会尝试把该链表的所有元素都选出来；另外该函数必须返回实际找到的键值对数量，因为有可能选中的键值对数量并没有达到指定的键值对数量。
+相对 dictGetRandomKey ，这个更快一些，因为它不需要遍历两次选中的链表；但它的随机分布并不好，因为在一个被选定的链表上，它会尝试把该链表的所有元素都选出来；当从一个链表上选取完毕后，它会尝试从紧挨着的下一个链表获取，所以随机性确实不好；而且当发现索引溢出时，会尝试重新生成随机 i，这就导致可能会有重复的链表被选取到；另外该函数必须返回实际找到的键值对数量，因为有可能选中的键值对数量并没有达到指定的键值对数量。
 
 ![](./picture/dictGetSomeKeys.png)
 
@@ -177,25 +346,25 @@ unsigned int dictGetSomeKeys(dict *d, dictEntry **des, unsigned int count)
 
 redis 遍历字典时没有使用正序索引进行遍历，而是用了一个独特的算法。
 
-首先需要注意的是，redis 中的 size 和 mask；当未扩缩容时，表 0 的 size 永远都是 2 的某个幂次方，而 mask 则永远等于 size - 1；如果发生扩缩容时，这个结论对表 1 也是成立的；所以当一个表发生扩缩容时，一个索引链表上键值对新的位置其实是可以预测的，比如一个索引为 00..00101 的链表，如果是扩容了 4 倍，那么其键值对新的索引的可以使用统一的格式表示:00..xx101, 其中 x 为 0 或者 1；缩容时也同样，只是这里是集中到一个新的索引上，而前面是分散开。
+首先需要注意的是，redis 中的 size 和 mask；当未扩缩容时，表 0 的 size 永远都是 2 的某个幂次方，而 mask 则永远等于 size - 1；如果发生扩缩容时，这个结论对表 1 也是成立的；所以当一个表发生扩缩容时，一个索引链表上键值对新的位置其实是可以预测的，比如一个索引为 00..00101 的链表，如果是扩容了 4 倍，那么其键值对新的索引可以使用统一的格式表示:00..xx101, 其中 x 为 0 或者 1；缩容时也同样，只是这里是集中到一个新的索引上，而前面是分散开。
 
 
 
 ##### Pieter Noordhuis 算法
 
-这个算法是这样的，它从 0 开始，操作完 0 处的数据后，不是从最低位进 1 ，而是从最高位进 1，即从高位到地位进制加 1，直到最后结果变为 0，处理结束。假设 size 是 8，然后发生了 2 倍的扩容，则索引变化如下：
+这个算法是这样的，它从 0 开始，操作完 0 处的数据后，不是从最低位进 1 ，而是从最高位进 1，即从高位到低位进制加 1，直到最后结果变为 0，处理结束。假设 size 是 8，然后发生了 2 倍的扩容，则索引变化如下：
 
 ![revse-index](./picture/revse-index.png)
 
-这个变化中有一个地方需要注意，假设未扩容时索引在遍历顺序中的索引为 i，则扩容后新的位置必然为 2*i 和 2*i+1；而且这个结论可以扩展，及假设发生了 n 倍的扩容，则新的位置必然在  [i* n ,(i+1)* n) 之间。其中n==2<sup>k</sup>。
+这个变化中有一个地方需要注意，假设未扩容时索引在遍历顺序中的索引为 i，则扩容后新的位置必然为 2\*i 和 2\*i+1；而且这个结论可以扩展，即假设发生了 n 倍的扩容，则新的位置必然在  [n* i ,n* (i + 1)) 之间。其中n==2<sup>k</sup>。
 
 ##### 扩容时的变量情况
 
 还是以上图为例。
 
-假设当前遍历的索引是 010；当 010 上的元素被遍历完毕后，正常下一步应该是 110；如果这时候发生了 2 倍的扩容，110 在新的遍历序列上就变成了 0110；
+假设当前遍历的索引是 010；当 010 上的元素被遍历完毕后，正常下一步应该是 110；如果这时候发生了 2 倍的扩容，110 在新的遍历序列上就变成了 0110 1110；
 
-可以看到，扩容前， 000 100 110 已经被遍历过；而扩容后这些索引处的元素在扩容后的位置为 0000 1000 0100 1100 0010 1010，这正好是 0110 前面的位置，这些新位置处的元素均已经被遍历过且不会被再次遍历。即这时候不会发生重复遍历，更不会发生遍历丢失的情况。其实可以证明，当只发生扩容时，这样的遍历算法不会发生任何丢失元素和重复遍历的情况，这主要是因为一个处在原始序列 i 前面的任何一个元素，其扩容后的新位置都不可能达到 i 扩容后的位置。
+可以看到，扩容前， 000 100 010 已经被遍历过；而扩容后这些索引处的元素在扩容后的位置为 0000 1000 0100 1100 0010 1010，这正好是 0110 前面的位置，这些新位置处的元素均已经被遍历过且不会被再次遍历。即这时候不会发生重复遍历，更不会发生遍历丢失的情况。其实可以证明，当只发生扩容时，这样的遍历算法不会发生任何丢失元素和重复遍历的情况，这主要是因为一个处在原始序列 i 前面的任何一个元素，其扩容后的新位置都不可能达到 i 扩容后的位置。
 
 ##### 缩容时的遍历情况
 
