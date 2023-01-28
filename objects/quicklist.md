@@ -8,7 +8,7 @@ list 是 redis 最基础的数据类型之一；它的优点和缺点很明显�
 
 在 redis 3.2 中引入了快表这种数据结构，它是 list 和 zip 两者结合的产物，它整体是一个 list，而每个节点则是一个 zip 节点。
 
-![quicklist-struct](/Users/guozhaoxin/code/redis-src-code/objects/picture/quicklist-struct.jpg)
+![quicklist-struct](./picture/quicklist-struct.jpg)
 
 ## 快表结构体
 
